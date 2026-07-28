@@ -1,6 +1,6 @@
 [project]
 name = "hyperlimit"
-version = "0.1.0"
+version = "0.2.0"
 description = "Adaptive (AIMD) concurrency limiter for asyncio: probe upward while work succeeds, back off sharply on throttle signals."
 readme = "README.md"
 requires-python = ">=3.11"
