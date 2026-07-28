@@ -76,6 +76,26 @@ async def call(request):
 A request bigger than a full bucket is admitted when the bucket is full and
 leaves a debt, which honestly delays followers instead of deadlocking.
 
+## RequestPacer
+
+When a provider quota is requests per second rather than concurrent work,
+`RequestPacer` admits at a steady rate without holding a permit for the
+operation's lifetime:
+
+```python
+from hyperlimit import RequestPacer
+
+pacer = RequestPacer(requests_per_second=15)
+
+async def submit(request):
+    await pacer.acquire()
+    return await provider.submit(request)
+```
+
+Its capacity-one token bucket allows one request immediately after idle time,
+then spaces concurrent callers evenly. Injectable `clock` and `sleep` keep
+rate contracts deterministic in tests.
+
 ## PartitionedLimiter
 
 Lanes that share one provider quota must not run independent AIMD loops —
