@@ -8,7 +8,7 @@ floor and a cool-down) when the workload reports a throttle signal (429s,
 connection storms).
 
 Born from a production incident: a fixed per-batch limit of 3 multiplied into
-~30 concurrent documents across parallel batches, drew a rate-limit storm,
+~30 concurrent jobs across parallel batches, drew a rate-limit storm,
 and the "safe" manual fallback left throughput on the table. The right limit
 moves with the provider's load — so probe for it.
 
@@ -95,6 +95,41 @@ async def submit(request):
 Its capacity-one token bucket allows one request immediately after idle time,
 then spaces concurrent callers evenly. Injectable `clock` and `sleep` keep
 rate contracts deterministic in tests.
+
+## HTTP admission (httpx)
+
+For HTTP workloads the right place to hold a permit is the transport: SDK
+clients retry internally, so gating the outer call holds one permit across
+every attempt and backoff sleep — and the intermediate 429s, the ones that
+carry `Retry-After`, never reach the limiter. `hyperlimit.httpx` (optional
+extra: `pip install "hyperlimit[httpx]"`; the core stays zero-dependency)
+admits one permit per HTTP attempt and reads verdicts off the wire:
+
+```python
+import httpx
+from hyperlimit import AdaptiveLimiter
+from hyperlimit.httpx import LimitedTransport
+
+limiter = AdaptiveLimiter(initial=3, floor=1, cap=12)
+client = httpx.AsyncClient(transport=LimitedTransport(limiter=limiter))
+
+response = await client.post("https://api.example.com/v1/things", json=payload)
+```
+
+Every 429 records a throttle with the parsed `Retry-After` (`retry-after-ms`
+wins over `retry-after`; HTTP-dates are ignored), every `<400` response
+records a success, and anything else — a rejected request, a 5xx, a
+transport failure — teaches the limiter nothing: a bad request is not
+evidence about capacity. The permit covers connect, send, and response
+headers; body reads and streaming are not gated. Any object with the permit
+and verdict methods works as the `limiter` — an `AdaptiveLimiter`, a
+`PartitionedLimiter` lane, or your own wrapper (`hyperlimit.httpx.Limiter`
+is the protocol).
+
+`governing_limiter(client)` answers "which limiter admits this client's
+attempts?" by best-effort introspection through wrapper chains (caching
+proxy → SDK client → httpx client → transport), so "was the limiter
+actually wired?" stays checkable.
 
 ## PartitionedLimiter
 
