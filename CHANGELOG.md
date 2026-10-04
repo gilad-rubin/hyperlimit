@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+- **Changed — growth needs load.** A success counts toward the next
+  increase only while demand (permits held plus callers waiting) fills at
+  least `growth_threshold` of the limit (default `0.5`, Netflix `AIMDLimit`'s
+  guard). Before, a lane succeeding one call at a time crept to `cap` and
+  fired its next burst into a 429 storm. `growth_threshold=0` restores the
+  old counting.
+- Bounded waits: `max_wait` on `AdaptiveLimiter` (and per call on
+  `acquire` / `Lane.acquire`) raises `AdmissionTimeout` — a `TimeoutError`
+  with `waited`, `queued`, `limit`, `limiter`, `lane` — instead of waiting
+  forever. On a lane one deadline covers the reserve and the shared permit.
+- Telemetry: `observe_limits(fn)` scopes a callback to the current task
+  (hypercache's `observe_cache` shape) and receives `Admitted`, `TimedOut`,
+  `Released`, `LimitChanged` and `Throttled` events. `name=` labels a
+  limiter; `waiting` joins `limit` / `active` and the snapshots.
+- `LimitedTransport(hold="body")` keeps the permit until the response body
+  closes, so streamed responses are counted. `"headers"` stays the default.
+- README: 429s that are not about capacity (spend caps without
+  `retry-after`).
+
 ## 0.3.0 — 2026-08-10
 
 - `hyperlimit.httpx`: HTTP admission module — `LimitedTransport` takes one

@@ -192,7 +192,7 @@ def test_partitioned_limiter_lane_works_as_the_limiter() -> None:
     clock = {"now": 0.0}
     shared = PartitionedLimiter(
         AdaptiveLimiter(
-            initial=8, floor=1, cap=12, successes_per_increase=1,
+            initial=8, floor=1, cap=12, successes_per_increase=1, growth_threshold=0.0,
             pause_on_throttle=False, clock=lambda: clock["now"],
         ),
         shares={"chat": 1.0},
@@ -214,6 +214,157 @@ def test_partitioned_limiter_lane_works_as_the_limiter() -> None:
     asyncio.run(main())
     assert shared.limit == 4
     assert shared.snapshot()["lanes"]["chat"]["active"] == 0
+
+
+# ── hold="body": the permit lasts until the body closes ────────────────
+
+
+class GatedStream(httpx.AsyncByteStream):
+    """A streamed body whose chunks arrive only when the test opens the gate."""
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = chunks
+        self.gate = asyncio.Event()
+        self.closed = False
+
+    async def __aiter__(self) -> Any:
+        for chunk in self.chunks:
+            await self.gate.wait()
+            yield chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def body_client(limiter: Limiter, handler: Callable[[httpx.Request], httpx.Response]) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        transport=LimitedTransport(
+            limiter=limiter, transport=httpx.MockTransport(handler), hold="body"
+        )
+    )
+
+
+def test_hold_body_keeps_the_permit_until_the_stream_is_read() -> None:
+    limiter = AdaptiveLimiter(initial=3, floor=1, cap=8)
+    body = GatedStream([b"a", b"b"])
+
+    async def main() -> None:
+        async with body_client(limiter, lambda request: httpx.Response(200, stream=body)) as client:
+            async with client.stream("GET", "http://test/") as response:
+                assert limiter.active == 1  # headers are in, the body is not
+                body.gate.set()
+                assert await response.aread() == b"ab"
+                assert limiter.active == 0  # read to the end: handed back
+            assert body.closed
+
+    asyncio.run(main())
+
+
+def test_hold_body_releases_when_the_stream_is_closed_early() -> None:
+    limiter = AdaptiveLimiter(initial=3, floor=1, cap=8)
+    body = GatedStream([b"a", b"b"])
+
+    async def main() -> None:
+        async with body_client(limiter, lambda request: httpx.Response(200, stream=body)) as client:
+            async with client.stream("GET", "http://test/"):
+                assert limiter.active == 1
+            assert limiter.active == 0  # never read: the block's exit closes it
+
+    asyncio.run(main())
+
+
+def test_hold_body_releases_when_the_reader_is_cancelled() -> None:
+    limiter = AdaptiveLimiter(initial=3, floor=1, cap=8)
+    body = GatedStream([b"a", b"b"])
+
+    async def main() -> None:
+        async with body_client(limiter, lambda request: httpx.Response(200, stream=body)) as client:
+
+            async def reader() -> None:
+                async with client.stream("GET", "http://test/") as response:
+                    async for _ in response.aiter_bytes():
+                        pass
+
+            task = asyncio.create_task(reader())
+            for _ in range(10):
+                await asyncio.sleep(0)
+            assert limiter.active == 1  # parked mid-stream
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert limiter.active == 0
+
+    asyncio.run(main())
+
+
+def test_hold_body_releases_once_even_if_closed_twice() -> None:
+    limiter = RecordingLimiter()
+    body = GatedStream([b"a"])
+
+    async def main() -> None:
+        transport = LimitedTransport(
+            limiter=limiter,
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, stream=body)),
+            hold="body",
+        )
+        response = await transport.handle_async_request(httpx.Request("GET", "http://test/"))
+        assert limiter.active == 1
+        await response.stream.aclose()
+        await response.stream.aclose()
+        assert limiter.active == 0
+
+    asyncio.run(main())
+
+
+def test_hold_body_releases_at_once_when_the_body_is_already_in_memory() -> None:
+    limiter = AdaptiveLimiter(initial=3, floor=1, cap=8)
+
+    async def main() -> None:
+        transport = LimitedTransport(
+            limiter=limiter,
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, content=b"x")),
+            hold="body",
+        )
+        await transport.handle_async_request(httpx.Request("GET", "http://test/"))
+        assert limiter.active == 0
+
+    asyncio.run(main())
+
+
+def test_hold_body_still_takes_the_verdict_at_the_headers() -> None:
+    limiter = RecordingLimiter()
+    body = GatedStream([b"slow down"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"retry-after": "2"}, stream=body)
+
+    async def main() -> None:
+        async with body_client(limiter, handler) as client:
+            async with client.stream("GET", "http://test/"):
+                assert limiter.throttles == [2.0]  # before any body byte
+
+    asyncio.run(main())
+    assert limiter.active == 0
+
+
+def test_hold_body_releases_when_the_attempt_raises() -> None:
+    limiter = RecordingLimiter()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("wire down")
+
+    async def main() -> None:
+        async with body_client(limiter, handler) as client:
+            with pytest.raises(httpx.ConnectError):
+                await client.get("http://test/")
+
+    asyncio.run(main())
+    assert limiter.active == 0
+
+
+def test_unknown_hold_is_rejected() -> None:
+    with pytest.raises(ValueError):
+        LimitedTransport(limiter=RecordingLimiter(), hold="forever")
 
 
 # ── the zero-dependency core ────────────────────────────────────────────

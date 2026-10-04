@@ -55,6 +55,64 @@ so parallel lanes or processes don't resume in lockstep.
 adds `max(1, int(sqrt(limit)))` — ramps a wide lane fast while staying
 gentle near small limits (Envoy's headroom heuristic).
 
+## Growth needs load
+
+A success counts toward the next increase only while the limit is actually
+in use: demand — permits held plus callers waiting — must fill at least
+`growth_threshold` of the limit (default `0.5`, Netflix `AIMDLimit`'s
+`inflight * 2 >= limit`). A quiet lane that succeeds one call at a time has
+shown nothing about capacity, so it stays put instead of creeping to `cap`
+and firing the next burst into a storm. `growth_threshold=0` counts every
+success.
+
+## Bounded waits
+
+A wait can outlive the request it serves — a gateway that gives up at 240 s,
+a client at 480 s. `max_wait` bounds it:
+
+```python
+from hyperlimit import AdaptiveLimiter, AdmissionTimeout
+
+limiter = AdaptiveLimiter(initial=4, cap=16, max_wait=30.0)
+
+try:
+    async with limiter:
+        ...
+except AdmissionTimeout as busy:
+    tell_the_user(f"busy, try again ({busy.queued} ahead)")
+```
+
+Past `max_wait` seconds — the limit full, or admissions paused by a
+throttle — `acquire` raises `AdmissionTimeout` (a `TimeoutError` carrying
+`waited`, `queued`, `limit`, `limiter` and `lane`) and holds nothing.
+`acquire(max_wait=...)` overrides the default per call; `None` waits forever.
+Behind `LimitedTransport` the bound is per HTTP attempt, so an SDK that
+retries failed connections retries this too — size `max_wait` per attempt.
+
+## Telemetry
+
+`observe_limits` installs a callback for the current task, so a request or
+workflow run collects the admissions it caused:
+
+```python
+from hyperlimit import AdaptiveLimiter, Admitted, observe_limits
+
+lane = AdaptiveLimiter(initial=4, cap=16, name="parse")
+
+with observe_limits(span_events.append):
+    async with lane:
+        ...
+# Admitted(limiter="parse", lane=None, waited=0.0, queued=0, limit=4, active=1), Released(...)
+```
+
+Events: `Admitted` and `TimedOut` (`waited` seconds, `queued` callers
+already waiting on arrival), `Released`, `LimitChanged` (old, new, reason)
+and `Throttled` (`window` opened, or `None` when absorbed into an open one).
+Each is emitted in the task that caused it; nothing is built while no
+observer is installed, and an observer that raises is logged and ignored.
+`name=` labels a limiter's events. `on_change` remains for a process-wide
+limit log.
+
 ## TokenBudget
 
 LLM providers throttle on tokens-per-minute more than on concurrency, so a
@@ -120,11 +178,31 @@ Every 429 records a throttle with the parsed `Retry-After` (`retry-after-ms`
 wins over `retry-after`; HTTP-dates are ignored), every `<400` response
 records a success, and anything else — a rejected request, a 5xx, a
 transport failure — teaches the limiter nothing: a bad request is not
-evidence about capacity. The permit covers connect, send, and response
-headers; body reads and streaming are not gated. Any object with the permit
-and verdict methods works as the `limiter` — an `AdaptiveLimiter`, a
-`PartitionedLimiter` lane, or your own wrapper (`hyperlimit.httpx.Limiter`
-is the protocol).
+evidence about capacity. Any object with the permit and verdict methods
+works as the `limiter` — an `AdaptiveLimiter`, a `PartitionedLimiter` lane,
+or your own wrapper (`hyperlimit.httpx.Limiter` is the protocol).
+
+By default the permit covers connect, send, and response headers; reading
+the body is not gated. A streamed response — a chat answer arriving over
+many seconds — then runs uncounted. `hold="body"` keeps the permit until
+the body is closed (read to the end, closed early, or abandoned through an
+error or cancellation):
+
+```python
+client = httpx.AsyncClient(transport=LimitedTransport(limiter=limiter, hold="body"))
+```
+
+httpx closes the body on a plain request and when a `client.stream(...)`
+block exits; a stream that is never closed keeps its permit. Verdicts still
+come from the status code as soon as headers arrive.
+
+**Not every 429 is about capacity.** Some providers answer 429 when a spend
+cap or quota is exhausted — Anthropic does, without `retry-after`. The
+transport cannot tell that from a rate limit, so the lane halves to its
+floor and pauses for `cooldown_seconds` on each retry. Harmless — nothing
+would succeed anyway — but it reads like a throttling storm in logs and
+telemetry. Recognise spend-cap errors in your own error handling and stop
+retrying them there.
 
 `governing_limiter(client)` answers "which limiter admits this client's
 attempts?" by best-effort introspection through wrapper chains (caching
@@ -154,4 +232,7 @@ await chat.record_success()           # verdicts feed the one shared loop
 ```
 
 Reserves are strict, not work-conserving; size the parent floor at or above
-the lane count so every lane keeps a live reserve.
+the lane count so every lane keeps a live reserve. A caller waiting for its
+lane's reserve counts as load on the shared limit, and a lane's `max_wait`
+(the parent's by default) covers both waits — the reserve, then the shared
+permit — as one deadline.

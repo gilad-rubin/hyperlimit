@@ -40,7 +40,8 @@ def test_concurrency_never_exceeds_limit() -> None:
 def test_additive_increase_after_n_successes() -> None:
     changes: list[tuple[int, int, str]] = []
     limiter = AdaptiveLimiter(
-        initial=2, floor=1, cap=4, successes_per_increase=3, on_change=lambda *a: changes.append(a)
+        initial=2, floor=1, cap=4, successes_per_increase=3, growth_threshold=0.0,
+        on_change=lambda *a: changes.append(a),
     )
 
     async def main() -> None:
