@@ -12,9 +12,13 @@ the core package stays dependency-free. Install with `hyperlimit[httpx]`.
 
 from __future__ import annotations
 
+import sys
+from collections.abc import AsyncIterator
 from typing import Any, Protocol, runtime_checkable
 
 import httpx
+
+_HOLDS = ("headers", "body")
 
 
 @runtime_checkable
@@ -46,9 +50,18 @@ class LimitedTransport(httpx.AsyncBaseTransport):
     which also puts the limiter's cooldown in the retry path: the next
     attempt waits for admission instead of firing into the storm.
 
-    The permit covers connect, send, and waiting for the server's response
-    headers. Reading the body afterwards is not gated, and neither is a
-    streamed response.
+    `hold` says how long one attempt occupies its permit:
+
+    - `"headers"` (default): connect, send, and waiting for the server's
+      response headers. Reading the body afterwards is not gated.
+    - `"body"`: until the response body is closed — read to the end, closed
+      early, or abandoned through an error or cancellation. Use it for
+      streamed responses (a chat answer streaming for many seconds), which
+      otherwise run uncounted. httpx closes the body for you on a plain
+      request and when a `client.stream(...)` block exits; a stream that is
+      never closed keeps its permit.
+
+    Verdicts come from the status code either way, as soon as headers arrive.
     """
 
     def __init__(
@@ -56,26 +69,63 @@ class LimitedTransport(httpx.AsyncBaseTransport):
         *,
         limiter: Limiter,
         transport: httpx.AsyncBaseTransport | None = None,
+        hold: str = "headers",
     ) -> None:
+        if hold not in _HOLDS:
+            raise ValueError(f"hold must be one of {_HOLDS}, got {hold!r}")
         self.limiter = limiter
         self._transport = transport or httpx.AsyncHTTPTransport()
+        self._hold = hold
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        async with self.limiter:
-            response = await self._transport.handle_async_request(request)
-            if response.status_code == 429:
-                await self.limiter.record_throttle(
-                    retry_after=retry_after_from(response.headers)
-                )
-            elif response.status_code < 400:
-                await self.limiter.record_success()
-            # Anything else — a rejected schema, a 5xx — teaches the limiter
-            # nothing: a bad request is not evidence about capacity. A
-            # transport-level failure raises out of here for the same reason.
+        if self._hold == "headers":
+            async with self.limiter:
+                return await self._attempt(request)
+        await self.limiter.__aenter__()
+        try:
+            response = await self._attempt(request)
+        except BaseException:
+            await self.limiter.__aexit__(*sys.exc_info())
+            raise
+        if response.is_closed:  # the body is already in memory: nothing left to hold
+            await self.limiter.__aexit__(None, None, None)
             return response
+        response.stream = _PermitReleasingStream(response.stream, self.limiter)
+        return response
+
+    async def _attempt(self, request: httpx.Request) -> httpx.Response:
+        response = await self._transport.handle_async_request(request)
+        if response.status_code == 429:
+            await self.limiter.record_throttle(retry_after=retry_after_from(response.headers))
+        elif response.status_code < 400:
+            await self.limiter.record_success()
+        # Anything else — a rejected schema, a 5xx — teaches the limiter
+        # nothing: a bad request is not evidence about capacity. A
+        # transport-level failure raises out of here for the same reason.
+        return response
 
     async def aclose(self) -> None:
         await self._transport.aclose()
+
+
+class _PermitReleasingStream(httpx.AsyncByteStream):
+    """A response body that hands its attempt's permit back when closed, once."""
+
+    def __init__(self, stream: Any, limiter: Limiter) -> None:
+        self._stream = stream
+        self._limiter: Limiter | None = limiter
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        async for chunk in self._stream:
+            yield chunk
+
+    async def aclose(self) -> None:
+        try:
+            await self._stream.aclose()
+        finally:
+            limiter, self._limiter = self._limiter, None
+            if limiter is not None:
+                await limiter.__aexit__(None, None, None)
 
 
 def retry_after_from(headers: Any) -> float | None:

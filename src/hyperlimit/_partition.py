@@ -13,6 +13,11 @@ strict, not work-conserving — an idle lane's reserve is headroom the parent
 cap simply never lends out; rounding can make reserves sum past the limit,
 and the parent's own permit count is what bounds the true total. Size the
 parent floor at or above the lane count so every lane keeps a live reserve.
+
+A caller waiting for its lane's reserve is demand on the shared limit, so it
+counts toward the parent's growth threshold and queue depth. A lane's
+`max_wait` (the parent's by default) covers both waits — for the reserve,
+then for the shared permit — as one deadline.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from hyperlimit._limiter import AdaptiveLimiter
+from hyperlimit._limiter import AdaptiveLimiter, _wait_until
 
 
 class PartitionedLimiter:
@@ -34,6 +39,7 @@ class PartitionedLimiter:
         self._limiter = limiter
         self._shares = dict(shares)
         self._active = {name: 0 for name in shares}
+        self._waiting = {name: 0 for name in shares}
         self._lanes = {name: Lane(self, name) for name in shares}
         self._cond: asyncio.Condition | None = None
 
@@ -51,7 +57,11 @@ class PartitionedLimiter:
         return {
             **self._limiter.snapshot(),
             "lanes": {
-                name: {"active": self._active[name], "reserved": self.reserved(name)}
+                name: {
+                    "active": self._active[name],
+                    "waiting": self._waiting[name],
+                    "reserved": self.reserved(name),
+                }
                 for name in self._shares
             },
         }
@@ -67,22 +77,44 @@ class PartitionedLimiter:
 
     # ── internals ───────────────────────────────────────────────────────
 
-    async def _acquire(self, name: str) -> None:
+    async def _acquire(self, name: str, max_wait: float | None) -> None:
+        parent = self._limiter
+        started = parent._clock()
+        queued = parent.waiting
+        deadline = parent._deadline(started, max_wait)
         cond = self._condition()
+
+        def note_waiting(delta: int) -> None:
+            self._waiting[name] += delta
+            parent._note_waiting(delta)
+
         async with cond:
-            while self._active[name] >= self.reserved(name):
-                await cond.wait()
-            self._active[name] += 1
-        try:
-            await self._limiter.acquire()  # total bound + throttle pause
-        except BaseException:
-            async with cond:
-                self._active[name] -= 1
-                cond.notify_all()
-            raise
+            admitted = await _wait_until(
+                cond,
+                lambda: self._active[name] < self.reserved(name),
+                deadline=deadline,
+                clock=parent._clock,
+                sleep=parent._sleep,
+                on_wait=note_waiting,
+            )
+            if admitted:
+                self._active[name] += 1
+        if admitted:
+            try:
+                admitted = await parent._take_permit(deadline)  # total bound + pause
+            except BaseException:
+                await self._drop(name)
+                raise
+            if not admitted:
+                await self._drop(name)
+        parent._report_admission(admitted, started=started, queued=queued, lane=name)
 
     async def _release(self, name: str) -> None:
-        await self._limiter.release()
+        await self._limiter._return_permit()
+        await self._drop(name)
+        self._limiter._report_release(lane=name)
+
+    async def _drop(self, name: str) -> None:
         cond = self._condition()
         async with cond:
             self._active[name] -= 1
@@ -108,8 +140,8 @@ class Lane:
     async def __aexit__(self, *exc_info: Any) -> None:
         await self.release()
 
-    async def acquire(self) -> None:
-        await self._partition._acquire(self._name)
+    async def acquire(self, *, max_wait: float | None = None) -> None:
+        await self._partition._acquire(self._name, max_wait)
 
     async def release(self) -> None:
         await self._partition._release(self._name)

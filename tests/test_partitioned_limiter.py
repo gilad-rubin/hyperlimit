@@ -111,7 +111,9 @@ def test_one_lane_throttle_shrinks_and_pauses_every_lane() -> None:
 
 def test_growth_from_one_lane_wakes_waiters_in_the_grown_reserve() -> None:
     fake = FakeTime()
-    part = _partitioned(fake, initial=5, floor=1, cap=20, successes_per_increase=1)
+    part = _partitioned(
+        fake, initial=5, floor=1, cap=20, successes_per_increase=1, growth_threshold=0.0
+    )
     embed = part.lane("embed")  # reserve at limit 5: max(1, round(1.0)) = 1
     admitted: list[int] = []
 
