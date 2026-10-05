@@ -15,8 +15,16 @@ from typing import Any, Callable
 import httpx
 import pytest
 
-from hyperlimit import AdaptiveLimiter, PartitionedLimiter
-from hyperlimit.httpx import Limiter, LimitedTransport, governing_limiter, retry_after_from
+from hyperlimit import AdaptiveLimiter, AdmissionTimeout, PartitionedLimiter
+from hyperlimit.httpx import (
+    BoundedLimiter,
+    Limiter,
+    LimitedTransport,
+    governing_limiter,
+    retry_after_from,
+)
+
+from tests._fake_time import FakeTime, drain
 
 
 class RecordingLimiter:
@@ -365,6 +373,136 @@ def test_hold_body_releases_when_the_attempt_raises() -> None:
 def test_unknown_hold_is_rejected() -> None:
     with pytest.raises(ValueError):
         LimitedTransport(limiter=RecordingLimiter(), hold="forever")
+
+
+# ── max_wait: one client's bound on a shared limiter ───────────────────
+
+
+def test_max_wait_bounds_one_client_while_another_on_the_same_limiter_waits() -> None:
+    fake = FakeTime()
+    limiter = AdaptiveLimiter(initial=1, floor=1, cap=4, clock=fake.clock, sleep=fake.sleep)
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(200)
+
+    chat = httpx.AsyncClient(
+        transport=LimitedTransport(
+            limiter=limiter, transport=httpx.MockTransport(handler), max_wait=2.0
+        )
+    )
+    batch = limited_client(limiter, handler)
+
+    async def main() -> None:
+        await limiter.acquire()  # the one permit is busy
+        live = asyncio.create_task(chat.get("http://test/chat"))
+        background = asyncio.create_task(batch.get("http://test/batch"))
+        await drain()
+        fake.advance(2.0)
+        await drain()
+        assert live.done()  # the live client gave up at its bound
+        with pytest.raises(AdmissionTimeout):
+            await live
+        assert not background.done()  # the background client waits its turn
+        await limiter.release()
+        await drain()
+        assert (await background).status_code == 200
+        await chat.aclose()
+        await batch.aclose()
+
+    asyncio.run(main())
+    assert calls == ["/batch"]  # the timed-out attempt never reached the wire
+    assert (limiter.active, limiter.waiting) == (0, 0)
+
+
+def test_transport_max_wait_overrides_the_limiter_default() -> None:
+    fake = FakeTime()
+    limiter = AdaptiveLimiter(
+        initial=1, floor=1, cap=4, max_wait=100.0, clock=fake.clock, sleep=fake.sleep
+    )
+    transport = LimitedTransport(
+        limiter=limiter,
+        transport=httpx.MockTransport(lambda request: httpx.Response(200)),
+        max_wait=1.0,
+    )
+
+    async def main() -> None:
+        await limiter.acquire()
+        attempt = asyncio.create_task(
+            transport.handle_async_request(httpx.Request("GET", "http://test/"))
+        )
+        await drain()
+        fake.advance(1.0)
+        await drain()
+        assert attempt.done()
+        with pytest.raises(AdmissionTimeout) as caught:
+            await attempt
+        assert caught.value.waited == 1.0
+
+    asyncio.run(main())
+
+
+def test_max_wait_and_hold_body_hand_the_permit_back_when_the_body_closes() -> None:
+    limiter = AdaptiveLimiter(initial=3, floor=1, cap=8)
+    body = GatedStream([b"a"])
+    client = httpx.AsyncClient(
+        transport=LimitedTransport(
+            limiter=limiter,
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, stream=body)),
+            hold="body",
+            max_wait=5.0,
+        )
+    )
+
+    async def main() -> None:
+        async with client, client.stream("GET", "http://test/") as response:
+            assert limiter.active == 1
+            body.gate.set()
+            await response.aread()
+            assert limiter.active == 0
+
+    asyncio.run(main())
+
+
+def test_max_wait_through_a_lane_names_the_lane() -> None:
+    fake = FakeTime()
+    shared = PartitionedLimiter(
+        AdaptiveLimiter(initial=2, floor=1, cap=4, clock=fake.clock, sleep=fake.sleep),
+        shares={"chat": 0.5, "batch": 0.5},
+    )
+    chat = shared.lane("chat")
+    transport = LimitedTransport(
+        limiter=chat,
+        transport=httpx.MockTransport(lambda request: httpx.Response(200)),
+        max_wait=3.0,
+    )
+
+    async def main() -> None:
+        await chat.acquire()  # the chat reserve (1) is full
+        attempt = asyncio.create_task(
+            transport.handle_async_request(httpx.Request("GET", "http://test/"))
+        )
+        await drain()
+        fake.advance(3.0)
+        await drain()
+        assert attempt.done()
+        with pytest.raises(AdmissionTimeout) as caught:
+            await attempt
+        assert caught.value.lane == "chat"
+
+    asyncio.run(main())
+
+
+def test_max_wait_needs_a_bounded_limiter() -> None:
+    assert isinstance(AdaptiveLimiter(), BoundedLimiter)
+    lane = PartitionedLimiter(AdaptiveLimiter(), shares={"a": 1.0}).lane("a")
+    assert isinstance(lane, BoundedLimiter)
+    with pytest.raises(TypeError):
+        LimitedTransport(limiter=RecordingLimiter(), max_wait=5.0)
+    with pytest.raises(ValueError):
+        LimitedTransport(limiter=AdaptiveLimiter(), max_wait=0)
+    LimitedTransport(limiter=RecordingLimiter())  # unbounded: the duck limiter still fits
 
 
 # ── the zero-dependency core ────────────────────────────────────────────

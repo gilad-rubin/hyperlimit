@@ -13,8 +13,8 @@ the core package stays dependency-free. Install with `hyperlimit[httpx]`.
 from __future__ import annotations
 
 import sys
-from collections.abc import AsyncIterator
-from typing import Any, Protocol, runtime_checkable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import Any, Protocol, cast, runtime_checkable
 
 import httpx
 
@@ -36,6 +36,18 @@ class Limiter(Protocol):
     async def record_success(self) -> None: ...
 
     async def record_throttle(self, *, retry_after: float | None = None) -> None: ...
+
+
+@runtime_checkable
+class BoundedLimiter(Limiter, Protocol):
+    """A `Limiter` whose one wait can be bounded: what `max_wait=` needs.
+
+    `AdaptiveLimiter` and a `PartitionedLimiter` lane both satisfy this.
+    """
+
+    async def acquire(self, *, max_wait: float | None = None) -> None: ...
+
+    async def release(self) -> None: ...
 
 
 class LimitedTransport(httpx.AsyncBaseTransport):
@@ -62,6 +74,12 @@ class LimitedTransport(httpx.AsyncBaseTransport):
       never closed keeps its permit.
 
     Verdicts come from the status code either way, as soon as headers arrive.
+
+    `max_wait` bounds THIS client's wait for a permit, per HTTP attempt,
+    overriding the limiter's own default; past it `AdmissionTimeout` raises
+    out of the request. Clients sharing one limiter can wait differently —
+    a live chat client gives up while a background client waits its turn —
+    without splitting the quota. It needs a `BoundedLimiter`.
     """
 
     def __init__(
@@ -70,28 +88,48 @@ class LimitedTransport(httpx.AsyncBaseTransport):
         limiter: Limiter,
         transport: httpx.AsyncBaseTransport | None = None,
         hold: str = "headers",
+        max_wait: float | None = None,
     ) -> None:
         if hold not in _HOLDS:
             raise ValueError(f"hold must be one of {_HOLDS}, got {hold!r}")
+        if max_wait is not None:
+            if max_wait <= 0:
+                raise ValueError(f"max_wait must be positive or None, got {max_wait}")
+            if not isinstance(limiter, BoundedLimiter):
+                raise TypeError(
+                    "max_wait needs a limiter with acquire(max_wait=) and release(), "
+                    f"got {type(limiter).__name__}"
+                )
         self.limiter = limiter
         self._transport = transport or httpx.AsyncHTTPTransport()
         self._hold = hold
+        self._max_wait = max_wait
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        if self._hold == "headers":
-            async with self.limiter:
-                return await self._attempt(request)
-        await self.limiter.__aenter__()
+        await self._take_permit()
         try:
             response = await self._attempt(request)
         except BaseException:
-            await self.limiter.__aexit__(*sys.exc_info())
+            await self._return_permit(*sys.exc_info())
             raise
-        if response.is_closed:  # the body is already in memory: nothing left to hold
-            await self.limiter.__aexit__(None, None, None)
+        if self._hold == "headers" or response.is_closed:
+            # Headers are in, or the body is already in memory: nothing left to hold.
+            await self._return_permit(None, None, None)
             return response
-        response.stream = _PermitReleasingStream(response.stream, self.limiter)
+        response.stream = _PermitReleasingStream(response.stream, self._return_permit)
         return response
+
+    async def _take_permit(self) -> None:
+        if self._max_wait is None:
+            await self.limiter.__aenter__()
+        else:
+            await cast(BoundedLimiter, self.limiter).acquire(max_wait=self._max_wait)
+
+    async def _return_permit(self, *exc_info: Any) -> None:
+        if self._max_wait is None:
+            await self.limiter.__aexit__(*exc_info)
+        else:
+            await cast(BoundedLimiter, self.limiter).release()
 
     async def _attempt(self, request: httpx.Request) -> httpx.Response:
         response = await self._transport.handle_async_request(request)
@@ -111,9 +149,9 @@ class LimitedTransport(httpx.AsyncBaseTransport):
 class _PermitReleasingStream(httpx.AsyncByteStream):
     """A response body that hands its attempt's permit back when closed, once."""
 
-    def __init__(self, stream: Any, limiter: Limiter) -> None:
+    def __init__(self, stream: Any, release: Callable[..., Awaitable[None]]) -> None:
         self._stream = stream
-        self._limiter: Limiter | None = limiter
+        self._release: Callable[..., Awaitable[None]] | None = release
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         async for chunk in self._stream:
@@ -123,9 +161,9 @@ class _PermitReleasingStream(httpx.AsyncByteStream):
         try:
             await self._stream.aclose()
         finally:
-            limiter, self._limiter = self._limiter, None
-            if limiter is not None:
-                await limiter.__aexit__(None, None, None)
+            release, self._release = self._release, None
+            if release is not None:
+                await release(None, None, None)
 
 
 def retry_after_from(headers: Any) -> float | None:
