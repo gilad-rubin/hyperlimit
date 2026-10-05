@@ -86,8 +86,25 @@ Past `max_wait` seconds — the limit full, or admissions paused by a
 throttle — `acquire` raises `AdmissionTimeout` (a `TimeoutError` carrying
 `waited`, `queued`, `limit`, `limiter` and `lane`) and holds nothing.
 `acquire(max_wait=...)` overrides the default per call; `None` waits forever.
-Behind `LimitedTransport` the bound is per HTTP attempt, so an SDK that
-retries failed connections retries this too — size `max_wait` per attempt.
+
+Behind `LimitedTransport`, `max_wait=` on the transport bounds one client's
+waits and overrides the limiter's default. Clients sharing one limiter —
+one quota — can then wait differently: a live chat client gives up while a
+background client waits its turn, without splitting the lane.
+
+```python
+lane = AdaptiveLimiter(initial=4, cap=16)  # one lane per credential
+chat = httpx.AsyncClient(transport=LimitedTransport(limiter=lane, max_wait=30.0))
+batch = httpx.AsyncClient(transport=LimitedTransport(limiter=lane))  # waits its turn
+```
+
+The transport needs a limiter with `acquire(max_wait=)` and `release()` —
+`AdaptiveLimiter` or a lane (the `hyperlimit.httpx.BoundedLimiter`
+protocol); a limiter without them is refused at construction. The bound is
+per HTTP attempt, and an SDK may retry it: the OpenAI Python SDK retries
+any non-httpx error from its transport (`max_retries`, default 2) and then
+raises `APIConnectionError` with the `AdmissionTimeout` as its `__cause__`.
+Size `max_wait` per attempt, or turn that client's SDK retries off.
 
 ## Telemetry
 

@@ -18,6 +18,11 @@
   limiter; `waiting` joins `limit` / `active` and the snapshots.
 - `LimitedTransport(hold="body")` keeps the permit until the response body
   closes, so streamed responses are counted. `"headers"` stays the default.
+- `LimitedTransport(max_wait=)` bounds one client's wait per HTTP attempt,
+  overriding the limiter's default, so clients sharing one lane (live chat,
+  background work) wait differently without splitting the quota. Needs a
+  `BoundedLimiter` (`acquire(max_wait=)` + `release()`); anything else is
+  refused at construction.
 - README: 429s that are not about capacity (spend caps without
   `retry-after`).
 
