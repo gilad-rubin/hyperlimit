@@ -253,3 +253,7 @@ the lane count so every lane keeps a live reserve. A caller waiting for its
 lane's reserve counts as load on the shared limit, and a lane's `max_wait`
 (the parent's by default) covers both waits — the reserve, then the shared
 permit — as one deadline.
+
+## Alternatives
+
+See [docs/alternatives.md](docs/alternatives.md) for a comparison with other asyncio adaptive concurrency and rate-limiting libraries (aioadaptive, aioresilience, Inspect AI's AdaptiveConcurrency, aiolimiter, etc.). Useful if evaluating replacements or ideas to learn from.
