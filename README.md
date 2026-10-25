@@ -199,6 +199,10 @@ evidence about capacity. Any object with the permit and verdict methods
 works as the `limiter` — an `AdaptiveLimiter`, a `PartitionedLimiter` lane,
 or your own wrapper (`hyperlimit.httpx.Limiter` is the protocol).
 
+Anthropic SDK 1.x requires an httpx2 client, which rejects an httpx transport (`TypeError`). Use
+`hyperlimit.httpx2.LimitedTransport` there (extra `hyperlimit[httpx2]`): same arguments and semantics,
+`http_client=httpx2.AsyncClient(transport=LimitedTransport(limiter=lane))`.
+
 By default the permit covers connect, send, and response headers; reading
 the body is not gated. A streamed response — a chat answer arriving over
 many seconds — then runs uncounted. `hold="body"` keeps the permit until

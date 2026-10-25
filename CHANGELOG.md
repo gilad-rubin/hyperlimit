@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **`hyperlimit.httpx2`** (extra `hyperlimit[httpx2]`): `LimitedTransport` for httpx2 clients, which
+  anthropic 1.x requires (`AsyncAnthropic(http_client=httpx.AsyncClient(...))` raises TypeError). Same lane
+  semantics, `hold`, `max_wait`, `governing_limiter`; the shared logic moved to a private module.
 - **Changed — growth needs load.** A success counts toward the next
   increase only while demand (permits held plus callers waiting) fills at
   least `growth_threshold` of the limit (default `0.5`, Netflix `AIMDLimit`'s
